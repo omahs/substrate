@@ -22,10 +22,11 @@
 use crate::{
 	chain_extension::ChainExtension,
 	storage::meter::Diff,
-	wasm::{env_def::ImportSatisfyCheck, OwnerInfo, PrefabWasmModule},
+	wasm::{env_def::Environment, OwnerInfo, PrefabWasmModule},
 	AccountIdOf, CodeVec, Config, Error, Schedule,
 };
 use codec::{Encode, MaxEncodedLen};
+use sp_core::crypto::UncheckedFrom;
 use sp_runtime::{traits::Hash, DispatchError};
 use sp_std::prelude::*;
 use wasm_instrument::parity_wasm::elements::{
@@ -48,13 +49,8 @@ impl<'a, T: Config> ContractModule<'a, T> {
 	/// Returns `Err` if the `original_code` couldn't be decoded or
 	/// if it contains an invalid module.
 	fn new(original_code: &[u8], schedule: &'a Schedule<T>) -> Result<Self, &'static str> {
-		use wasmi_validation::{validate_module, PlainValidator};
-
 		let module =
 			elements::deserialize_buffer(original_code).map_err(|_| "Can't decode wasm code")?;
-
-		// Make sure that the module is valid.
-		validate_module::<PlainValidator>(&module, ()).map_err(|_| "Module is not valid")?;
 
 		// Return a `ContractModule` instance with
 		// __valid__ module.
@@ -284,22 +280,29 @@ impl<'a, T: Config> ContractModule<'a, T> {
 	/// - checks any imported function against defined host functions set, incl. their signatures.
 	/// - if there is a memory import, returns it's descriptor
 	/// `import_fn_banlist`: list of function names that are disallowed to be imported
-	fn scan_imports<C: ImportSatisfyCheck>(
+	fn scan_imports(
 		&self,
 		import_fn_banlist: &[&[u8]],
 	) -> Result<Option<&MemoryType>, &'static str> {
 		let module = &self.module;
-
-		let types = module.type_section().map(|ts| ts.types()).unwrap_or(&[]);
 		let import_entries = module.import_section().map(|is| is.entries()).unwrap_or(&[]);
-
 		let mut imported_mem_type = None;
 
 		for import in import_entries {
-			let type_idx = match *import.external() {
+			match *import.external() {
 				External::Table(_) => return Err("Cannot import tables"),
 				External::Global(_) => return Err("Cannot import globals"),
-				External::Function(ref type_idx) => type_idx,
+				External::Function(_) => {
+					if !T::ChainExtension::enabled() &&
+						import.field().as_bytes() == b"seal_call_chain_extension"
+					{
+						return Err("module uses chain extensions but chain extensions are disabled")
+					}
+
+					if import_fn_banlist.iter().any(|f| import.field().as_bytes() == *f) {
+						return Err("module imports a banned function")
+					}
+				},
 				External::Memory(ref memory_type) => {
 					if import.module() != IMPORT_MODULE_MEMORY {
 						return Err("Invalid module for imported memory")
@@ -313,22 +316,6 @@ impl<'a, T: Config> ContractModule<'a, T> {
 					imported_mem_type = Some(memory_type);
 					continue
 				},
-			};
-
-			let Type::Function(ref func_ty) = types
-				.get(*type_idx as usize)
-				.ok_or("validation: import entry points to a non-existent type")?;
-
-			if !T::ChainExtension::enabled() &&
-				import.field().as_bytes() == b"seal_call_chain_extension"
-			{
-				return Err("module uses chain extensions but chain extensions are disabled")
-			}
-
-			if import_fn_banlist.iter().any(|f| import.field().as_bytes() == *f) ||
-				!C::can_satisfy(import.module().as_bytes(), import.field().as_bytes(), func_ty)
-			{
-				return Err("module imports a non-existent function")
 			}
 		}
 		Ok(imported_mem_type)
@@ -366,46 +353,27 @@ fn get_memory_limits<T: Config>(
 	}
 }
 
-fn check_and_instrument<C: ImportSatisfyCheck, T: Config>(
-	original_code: &[u8],
-	schedule: &Schedule<T>,
-) -> Result<(Vec<u8>, (u32, u32)), &'static str> {
-	let result = (|| {
-		let contract_module = ContractModule::new(original_code, schedule)?;
-		contract_module.scan_exports()?;
-		contract_module.ensure_no_internal_memory()?;
-		contract_module.ensure_table_size_limit(schedule.limits.table_size)?;
-		contract_module.ensure_global_variable_limit(schedule.limits.globals)?;
-		contract_module.ensure_no_floating_types()?;
-		contract_module.ensure_parameter_limit(schedule.limits.parameters)?;
-		contract_module.ensure_br_table_size_limit(schedule.limits.br_table_size)?;
-
-		// We disallow importing `gas` function here since it is treated as implementation detail.
-		let disallowed_imports = [b"gas".as_ref()];
-		let memory_limits =
-			get_memory_limits(contract_module.scan_imports::<C>(&disallowed_imports)?, schedule)?;
-
-		let code = contract_module
-			.inject_gas_metering()?
-			.inject_stack_height_metering()?
-			.into_wasm_code()?;
-
-		Ok((code, memory_limits))
-	})();
-
-	if let Err(msg) = &result {
-		log::debug!(target: "runtime::contracts", "CodeRejected: {}", msg);
-	}
-
-	result
-}
-
-fn do_preparation<C: ImportSatisfyCheck, T: Config>(
+/// Loads the given module given in `original_code`, performs some checks on it and
+/// does some preprocessing.
+///
+/// The checks are:
+///
+/// - provided code is a valid wasm module.
+/// - the module doesn't define an internal memory instance,
+/// - imported memory (if any) doesn't reserve more memory than permitted by the `schedule`,
+/// - all imported functions from the external environment matches defined by `env` module,
+///
+/// The preprocessing includes injecting code for gas metering and metering the height of stack.
+pub fn prepare_contract<E, T: Config>(
 	original_code: CodeVec<T>,
 	schedule: &Schedule<T>,
 	owner: AccountIdOf<T>,
-) -> Result<PrefabWasmModule<T>, (DispatchError, &'static str)> {
-	let (code, (initial, maximum)) = check_and_instrument::<C, T>(original_code.as_ref(), schedule)
+) -> Result<PrefabWasmModule<T>, (DispatchError, &'static str)>
+where
+	E: Environment<()>,
+	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
+{
+	let (code, (initial, maximum)) = check_and_instrument::<E, T>(original_code.as_ref(), schedule)
 		.map_err(|msg| (<Error<T>>::CodeRejected.into(), msg))?;
 	let original_code_len = original_code.len();
 
@@ -434,35 +402,57 @@ fn do_preparation<C: ImportSatisfyCheck, T: Config>(
 	Ok(module)
 }
 
-/// Loads the given module given in `original_code`, performs some checks on it and
-/// does some preprocessing.
-///
-/// The checks are:
-///
-/// - provided code is a valid wasm module.
-/// - the module doesn't define an internal memory instance,
-/// - imported memory (if any) doesn't reserve more memory than permitted by the `schedule`,
-/// - all imported functions from the external environment matches defined by `env` module,
-///
-/// The preprocessing includes injecting code for gas metering and metering the height of stack.
-pub fn prepare_contract<T: Config>(
-	original_code: CodeVec<T>,
-	schedule: &Schedule<T>,
-	owner: AccountIdOf<T>,
-) -> Result<PrefabWasmModule<T>, (DispatchError, &'static str)> {
-	do_preparation::<super::runtime::Env, T>(original_code, schedule, owner)
-}
-
 /// The same as [`prepare_contract`] but without constructing a new [`PrefabWasmModule`]
 ///
 /// # Note
 ///
 /// Use this when an existing contract should be re-instrumented with a newer schedule version.
-pub fn reinstrument_contract<T: Config>(
+pub fn check_and_instrument<E, T: Config>(
 	original_code: &[u8],
 	schedule: &Schedule<T>,
-) -> Result<Vec<u8>, &'static str> {
-	Ok(check_and_instrument::<super::runtime::Env, T>(original_code, schedule)?.0)
+) -> Result<(Vec<u8>, (u32, u32)), &'static str>
+where
+	E: Environment<()>,
+	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
+{
+	let result = (|| {
+		let contract_module = ContractModule::new(original_code, schedule)?;
+		contract_module.scan_exports()?;
+		contract_module.ensure_no_internal_memory()?;
+		contract_module.ensure_table_size_limit(schedule.limits.table_size)?;
+		contract_module.ensure_global_variable_limit(schedule.limits.globals)?;
+		contract_module.ensure_no_floating_types()?;
+		contract_module.ensure_parameter_limit(schedule.limits.parameters)?;
+		contract_module.ensure_br_table_size_limit(schedule.limits.br_table_size)?;
+
+		// We disallow importing `gas` function here since it is treated as implementation detail.
+		let disallowed_imports = [b"gas".as_ref()];
+		let memory_limits =
+			get_memory_limits(contract_module.scan_imports(&disallowed_imports)?, schedule)?;
+
+		// We validate the module by instantiating it with an bogus host state object
+		// This will validate the wasm and check that all imported objects are provided
+		// We want to do that before the instrumentation as this requires a valid module
+		PrefabWasmModule::<T>::instantiate::<E, _>(original_code, (), memory_limits).map_err(
+			|msg| {
+				log::debug!(target: "runtime::contracts", "validation failed: {}", msg);
+				"validation failed"
+			},
+		)?;
+
+		let code = contract_module
+			.inject_gas_metering()?
+			.inject_stack_height_metering()?
+			.into_wasm_code()?;
+
+		Ok((code, memory_limits))
+	})();
+
+	if let Err(msg) = &result {
+		log::debug!(target: "runtime::contracts", "CodeRejected: {}", msg);
+	}
+
+	result
 }
 
 /// Alternate (possibly unsafe) preparation functions used only for benchmarking.
@@ -473,13 +463,7 @@ pub fn reinstrument_contract<T: Config>(
 /// in production code.
 #[cfg(feature = "runtime-benchmarks")]
 pub mod benchmarking {
-	use super::{elements::FunctionType, *};
-
-	impl ImportSatisfyCheck for () {
-		fn can_satisfy(_module: &[u8], _name: &[u8], _func_type: &FunctionType) -> bool {
-			true
-		}
-	}
+	use super::*;
 
 	/// Prepare function that neither checks nor instruments the passed in code.
 	pub fn prepare_contract<T: Config>(
@@ -488,7 +472,7 @@ pub mod benchmarking {
 		owner: AccountIdOf<T>,
 	) -> Result<PrefabWasmModule<T>, &'static str> {
 		let contract_module = ContractModule::new(&original_code, schedule)?;
-		let memory_limits = get_memory_limits(contract_module.scan_imports::<()>(&[])?, schedule)?;
+		let memory_limits = get_memory_limits(contract_module.scan_imports(&[])?, schedule)?;
 		Ok(PrefabWasmModule {
 			instruction_weights_version: schedule.instruction_weights.version,
 			initial: memory_limits.0,
@@ -530,27 +514,28 @@ mod tests {
 	#[allow(unreachable_code)]
 	mod env {
 		use super::*;
+		use crate::wasm::runtime::{Runtime, TrapReason};
 
 		// Define test environment for tests. We need ImportSatisfyCheck
 		// implementation from it. So actual implementations doesn't matter.
 		#[define_env]
 		pub mod test_env {
-			fn panic(_ctx: crate::wasm::Runtime<E>) -> Result<(), TrapReason> {
+			fn panic(_ctx: Runtime<E>) -> Result<(), TrapReason> {
 				Ok(())
 			}
 
 			// gas is an implementation defined function and a contract can't import it.
-			fn gas(_ctx: crate::wasm::Runtime<E>, _amount: u32) -> Result<(), TrapReason> {
+			fn gas(_ctx: Runtime<E>, _amount: u32) -> Result<(), TrapReason> {
 				Ok(())
 			}
 
-			fn nop(_ctx: crate::wasm::Runtime<E>, _unused: u64) -> Result<(), TrapReason> {
+			fn nop(_ctx: Runtime<E>, _unused: u64) -> Result<(), TrapReason> {
 				Ok(())
 			}
 
-			// new version of nop with other data type for argumebt
+			// new version of nop with other data type for argument
 			#[version(1)]
-			fn nop(_ctx: crate::wasm::Runtime<E>, _unused: i32) -> Result<(), TrapReason> {
+			fn nop(_ctx: Runtime<E>, _unused: i32) -> Result<(), TrapReason> {
 				Ok(())
 			}
 		}
@@ -572,7 +557,7 @@ mod tests {
 					},
 					.. Default::default()
 				};
-				let r = do_preparation::<env::Env, Test>(wasm, &schedule, ALICE);
+				let r = prepare_contract::<env::Env, Test>(wasm, &schedule, ALICE);
 				assert_matches::assert_matches!(r.map_err(|(_, msg)| msg), $($expected)*);
 			}
 		};
@@ -708,7 +693,7 @@ mod tests {
 				(func (export "deploy"))
 			)
 			"#,
-			Err("Module is not valid")
+			Err("Requested initial number of pages should not exceed the requested maximum")
 		);
 
 		prepare_test!(
@@ -774,7 +759,7 @@ mod tests {
 				(func (export "deploy"))
 			)
 			"#,
-			Err("Module is not valid")
+			Err("Multiple memory imports defined")
 		);
 
 		prepare_test!(
@@ -900,7 +885,7 @@ mod tests {
 				(func (export "deploy"))
 			)
 			"#,
-			Err("module imports a non-existent function")
+			Err("module imports a banned function")
 		);
 
 		// memory is in "env" and not in "seal0"
@@ -955,7 +940,7 @@ mod tests {
 				(func (export "deploy"))
 			)
 			"#,
-			Err("module imports a non-existent function")
+			Err("module imports a banned function")
 		);
 
 		prepare_test!(
@@ -968,7 +953,7 @@ mod tests {
 				(func (export "deploy"))
 			)
 			"#,
-			Err("module imports a non-existent function")
+			Err("validation failed")
 		);
 	}
 

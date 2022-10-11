@@ -513,7 +513,7 @@ fn calling_plain_account_fails() {
 
 #[test]
 fn instantiate_and_call_and_deposit_event() {
-	let (wasm, code_hash) = compile_module::<Test>("return_from_start_fn").unwrap();
+	let (wasm, code_hash) = compile_module::<Test>("event_and_return_on_deploy").unwrap();
 
 	ExtBuilder::default().existential_deposit(500).build().execute_with(|| {
 		let _ = Balances::deposit_creating(&ALICE, 1_000_000);
@@ -3566,10 +3566,7 @@ fn code_rejected_error_works() {
 			true,
 		);
 		assert_err!(result.result, <Error<Test>>::CodeRejected);
-		assert_eq!(
-			std::str::from_utf8(&result.debug_message).unwrap(),
-			"module imports a non-existent function"
-		);
+		assert_eq!(std::str::from_utf8(&result.debug_message).unwrap(), "validation failed");
 	});
 }
 
