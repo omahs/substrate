@@ -429,7 +429,7 @@ fn verification_should_be_stateless() {
 	// Verify proof without relying on any on-chain data.
 	let leaf = crate::primitives::DataOrHash::Data(leaves[0].clone());
 	assert_eq!(
-		crate::verify_leaves_proof::<<Test as Config>::Hashing, _>(root, vec![leaf], proof5),
+		crate::verify_leaves_proof::<<Test as Config>::Hashing, _>(root, vec![leaf], &proof5),
 		Ok(())
 	);
 }
@@ -461,7 +461,7 @@ fn should_verify_batch_proof_statelessly() {
 				.into_iter()
 				.map(|leaf| crate::primitives::DataOrHash::Data(leaf))
 				.collect(),
-			proof
+			&proof
 		),
 		Ok(())
 	);
